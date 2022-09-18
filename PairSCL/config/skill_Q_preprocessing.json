@@ -1,0 +1,18 @@
+{
+    "data_dir": "../datasets/skill",
+    "target_dir": "../datasets/preprocessed/SKILL_Q",
+
+    "lowercase": false,
+    "ignore_punctuation": false,
+    "num_words": null,
+    "stopwords": [],
+    "labeldict": {"action": 0,
+                  "causal relationship": 1,
+                  "character": 2,
+                  "outcome resolution": 3,
+                  "prediction": 4,
+                  "feeling": 5,
+                  "setting": 6},
+    "bos": "_BOS_",
+    "eos": "_EOS_"
+}

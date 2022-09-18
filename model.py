@@ -5,7 +5,7 @@ from torch.autograd import Variable
 import torch_geometric.nn as pyg_nn
 from transformers import RobertaModel
 from data import *
-from main import parse_option
+# from main import parse_option
 
 
 class GraphModule(nn.Module):
@@ -266,125 +266,34 @@ class ComparisonModel(nn.Module):
         return output
 
 
-class MyModel(nn.Module):
-
-    def __init__(self, config):
-        super(MyModel, self).__init__()
-        self.sub_q1_model = GraphModule(config.graph_model_name, config.graph_layer_num, config.glove_dim,
-                                        config.hidden_dim, config.hidden_dim)
-        self.sub_q2_model = GraphModule(config.graph_model_name, config.graph_layer_num, config.glove_dim,
-                                        config.hidden_dim, config.hidden_dim)
-        self.q_model = GraphModule(config.graph_model_name, config.graph_layer_num, config.glove_dim,
-                                   config.hidden_dim, config.hidden_dim)
-
-        self.context_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
-                                              config.hidden_dim, config.dropout_p)
-        self.sub_q1_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
-                                             config.hidden_dim, config.dropout_p)
-        self.sub_q2_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
-                                             config.hidden_dim, config.dropout_p)
-
-        self.sub_q1_bi_attn = BiAttention(config.hidden_dim, config.hidden_dim, config.dropout_p)
-        self.sub_q2_bi_attn = BiAttention(config.hidden_dim, config.hidden_dim, config.dropout_p)
-
-        self.ctx_attn_1 = GatedAttention(config.hidden_dim, config.hidden_dim, config.hidden_dim, config.hidden_dim,
-                                         config.dropout_p)
-        self.ctx_attn_2 = GatedAttention(config.hidden_dim, config.hidden_dim, config.hidden_dim, config.hidden_dim,
-                                         config.dropout_p)
-
-        self.start_rnn = nn.LSTM(config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
-        self.end_rnn = nn.LSTM(2 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
-        self.type_rnn = nn.LSTM(2 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
-
-        self.start_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 1)
-        self.end_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 1)
-        self.type_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 3)
-
-    def forward(self, ctx_input_ids, ctx_attn_mask, sub_q1_input_ids, sub_q1_attn_mask, sub_q2_input_ids,
-                sub_q2_attn_mask, sub_q1_edge_list, sub_q2_edge_list, sub_q1_features, sub_q2_features, sub_q1_mask,
-                sub_q2_mask):
-        sub_q1_graph_list = [create_pyg_data_object(features, edge_list) for (features, edge_list)
-                             in zip(sub_q1_features, sub_q1_edge_list)]
-        sub_q1_graph_batch = create_pyg_batch_object(sub_q1_graph_list)
-        # [tot_num_nodes, hidden_dim]
-        sub_q1_graph_emb = self.sub_q1_model(sub_q1_graph_batch.x.cuda(), sub_q1_graph_batch.edge_index.long().cuda())
-        # [bsz, q_len, hidden_dim]
-        sub_q1_graph_emb, sub_q1_graph_mask = split_graph_features(sub_q1_graph_emb, sub_q1_mask)
-
-        sub_q2_graph_list = [create_pyg_data_object(features, edge_list) for (features, edge_list)
-                             in zip(sub_q2_features, sub_q2_edge_list)]
-        sub_q2_graph_batch = create_pyg_batch_object(sub_q2_graph_list)
-        # [tot_num_nodes, hidden_dim]
-        sub_q2_graph_emb_ = self.sub_q2_model(sub_q2_graph_batch.x.cuda(), sub_q2_graph_batch.edge_index.cuda())
-        # [bsz, q_len, hidden_dim]
-        sub_q2_graph_emb, sub_q2_graph_mask = split_graph_features(sub_q2_graph_emb_, sub_q2_mask)
-
-        # [bsz, c_len, hidden_dim]
-        context_encoding, context_mask = self.context_encoder(ctx_input_ids, ctx_attn_mask)
-        # [bsz, q_len, hidden_dim]
-        sub_q1_encoding, sub_q1_attn_mask = self.sub_q1_encoder(sub_q1_input_ids, sub_q1_attn_mask)
-        sub_q2_encoding, sub_q2_attn_mask = self.sub_q2_encoder(sub_q2_input_ids, sub_q2_attn_mask)
-
-        # [bsz, q_len, hidden_dim]
-        updated_sub_q1_encoding = self.sub_q1_bi_attn(sub_q1_encoding, sub_q1_graph_emb, sub_q1_graph_mask)
-        updated_sub_q2_encoding = self.sub_q2_bi_attn(sub_q2_encoding, sub_q2_graph_emb, sub_q2_graph_mask)
-
-        # [bsz, c_len, hidden_dim]
-        updated_context_encoding = self.ctx_attn_1(context_encoding, updated_sub_q1_encoding, sub_q1_attn_mask)
-        final_context_encoding = self.ctx_attn_2(updated_context_encoding, updated_sub_q2_encoding, sub_q2_attn_mask)
-
-        # [bsz, c_len, 2 * hidden_dim]
-        start_logit, (h_n, c_n) = self.start_rnn(final_context_encoding)
-        # [bsz, c_len, 4 * hidden_dim]
-        end_rnn_input = torch.cat([final_context_encoding, start_logit], dim=-1)
-        # [bsz, c_len, 2 * hidden_dim]
-        end_logit, (h_n, c_n) = self.end_rnn(end_rnn_input)
-        # [bsz, c_len, 4 * hidden_dim]
-        type_rnn_input = torch.cat([final_context_encoding, end_logit], dim=-1)
-        # [bsz, c_len, 2 * hidden_dim]
-        type_logit, (h_n, c_n) = self.type_rnn(type_rnn_input)
-        # [bsz, 2 * hidden_dim]
-        type_logit = type_logit[:, -1, :]
-
-        start_pred = self.start_prediction(start_logit, context_mask)
-        end_pred = self.end_prediction(end_logit, context_mask)
-        type_pred = self.type_prediction(type_logit)
-
-        return start_pred, end_pred, type_pred
-
-
 class BaseLineModel(nn.Module):
 
     def __init__(self, config):
         super(BaseLineModel, self).__init__()
         self.context_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
                                               config.hidden_dim, config.dropout_p)
-        self.ques_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
-                                           config.hidden_dim, config.dropout_p)
         self.sub_q1_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
                                              config.hidden_dim, config.dropout_p)
         self.sub_q2_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
                                              config.hidden_dim, config.dropout_p)
 
-        self.comp_model = ComparisonModel(config.hidden_dim, config.hidden_dim, config.dropout_p)
+        self.bridge_model = BridgeModel(config.hidden_dim, config.hidden_dim, config.dropout_p)
 
-        self.start_rnn = nn.LSTM(config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
-        self.end_rnn = nn.LSTM(3 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
-        self.type_rnn = nn.LSTM(3 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
+        self.start_rnn = nn.LSTM(2 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
+        self.end_rnn = nn.LSTM(4 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
+        self.type_rnn = nn.LSTM(4 * config.hidden_dim, config.hidden_dim, bidirectional=True, batch_first=True)
 
         self.start_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 1)
         self.end_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 1)
         self.type_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 3)
 
-    def forward(self, context_input_ids, context_attention_mask, ques_input_ids, ques_attn_mask, sub_q1_input_ids,
-                sub_q1_attention_mask, sub_q2_input_ids, sub_q2_attention_mask):
+    def forward(self, context_input_ids, context_attention_mask, sub_q1_input_ids, sub_q1_attention_mask,
+                sub_q2_input_ids, sub_q2_attention_mask):
         context_encoding, context_mask = self.context_encoder(context_input_ids, context_attention_mask)
-        ques_encoding, ques_mask = self.ques_encoder(ques_input_ids, ques_attn_mask)
         sub_q1_encoding, sub_q1_mask = self.sub_q1_encoder(sub_q1_input_ids, sub_q1_attention_mask)
         sub_q2_encoding, sub_q2_mask = self.sub_q2_encoder(sub_q2_input_ids, sub_q2_attention_mask)
 
-        output = self.comp_model(context_encoding, ques_encoding, ques_mask, sub_q1_encoding, sub_q1_mask,
-                                 sub_q2_encoding, sub_q2_mask)
+        output = self.bridge_model(context_encoding, sub_q1_encoding, sub_q1_mask, sub_q2_encoding, sub_q2_mask)
 
         start_logit, (h_n, c_n) = self.start_rnn(output)
         end_rnn_input = torch.cat([output, start_logit], dim=-1)
@@ -406,10 +315,12 @@ class NewModel(nn.Module):
         super(NewModel, self).__init__()
         self.ctx_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
                                           config.hidden_dim, config.dropout_p)
-        self.sub_q1_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
-                                             config.hidden_dim, config.dropout_p)
-        self.sub_q2_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
-                                             config.hidden_dim, config.dropout_p)
+        # self.sub_q1_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
+        #                                      config.hidden_dim, config.dropout_p)
+        # self.sub_q2_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
+        #                                      config.hidden_dim, config.dropout_p)
+        self.ques_encoder = RobertaEncoder(config.roberta_config, config.roberta_dim, config.hidden_dim,
+                                           config.hidden_dim, config.dropout_p)
         self.type_classifier = TypeClassifier(config)
         self.bridge_model = BridgeModel(config.hidden_dim, config.hidden_dim, config.dropout_p)
         self.comp_model = ComparisonModel(config.hidden_dim, config.hidden_dim, config.dropout_p)
@@ -423,15 +334,14 @@ class NewModel(nn.Module):
         self.answer_type_prediction = OutputLayer(2 * config.hidden_dim, config.hidden_dim, config.dropout_p, 3)
 
     def forward(self, ctx_input_ids, ctx_attn_mask, ques_input_ids, ques_attn_mask, sub_q1_input_ids, sub_q1_attn_mask,
-                sub_q2_input_ids, sub_q2_attn_mask):
+                sub_q2_input_ids, sub_q2_attn_mask, type_pred):
         # [bsz, c_len, hidden_dim]
         ctx_features, ctx_attn_mask = self.ctx_encoder(ctx_input_ids, ctx_attn_mask)
         # [bsz, q_len, hidden_dim]
-        sub_q1_features, sub_q1_attn_mask = self.sub_q1_encoder(sub_q1_input_ids, sub_q1_attn_mask)
-        sub_q2_features, sub_q2_attn_mask = self.sub_q2_encoder(sub_q2_input_ids, sub_q2_attn_mask)
-        # [bsz, 2]
-        ques_type_logits = self.type_classifier(ques_input_ids, ques_attn_mask)
-        type_pred = ques_type_logits.argmax(dim=-1)
+        ques_features, ques_attn_mask = self.ques_encoder(ques_input_ids, ques_attn_mask)
+        sub_q1_features, sub_q1_attn_mask = self.ques_encoder(sub_q1_input_ids, sub_q1_attn_mask)
+        sub_q2_features, sub_q2_attn_mask = self.ques_encoder(sub_q2_input_ids, sub_q2_attn_mask)
+
         brig_ctx_features, brig_sub_q1_features, brig_sub_q1_attn_mask, brig_sub_q2_features, brig_sub_q2_attn_mask = \
             [], [], [], [], []
         comp_ctx_features, comp_sub_q1_features, comp_sub_q1_attn_mask, comp_sub_q2_features, comp_sub_q2_attn_mask = \
@@ -464,8 +374,8 @@ class NewModel(nn.Module):
             torch.stack(comp_ctx_features, dim=0), torch.stack(comp_sub_q1_features, dim=0), \
             torch.stack(comp_sub_q1_attn_mask, dim=0), torch.stack(comp_sub_q2_features, dim=0), \
             torch.stack(comp_sub_q2_attn_mask, dim=0)
-        comp_output = self.comp_model(comp_ctx_features, comp_sub_q1_features, comp_sub_q1_attn_mask,
-                                      comp_sub_q2_features, comp_sub_q2_attn_mask)
+        comp_output = self.comp_model(comp_ctx_features, ques_features, ques_attn_mask, comp_sub_q1_features,
+                                      comp_sub_q1_attn_mask, comp_sub_q2_features, comp_sub_q2_attn_mask)
         # [bsz, c_len, 2 * hidden_dim]
         updated_ctx_features = torch.concat([brig_output, comp_output], dim=0)
         updated_ctx_features = updated_ctx_features[torch.randperm(updated_ctx_features.size(0))]
@@ -487,7 +397,7 @@ class NewModel(nn.Module):
         end_pred = self.end_prediction(end_logit, ctx_attn_mask)
         answer_type_pred = self.answer_type_prediction(answer_type_logit)
 
-        return start_pred, end_pred, answer_type_pred, ques_type_logits
+        return start_pred, end_pred, answer_type_pred
 
 
 if __name__ == '__main__':

@@ -136,7 +136,7 @@ def collate_fn(batch):
     answer_types = torch.tensor(answer_types, dtype=torch.long)
     ques_types = torch.tensor(ques_types, dtype=torch.long)
 
-    return ctx_input_ids, ctx_attn_masks, ques_input_ids, ques_attn_masks,sub_q1_input_ids, sub_q1_attn_masks, \
+    return ctx_input_ids, ctx_attn_masks, ques_input_ids, ques_attn_masks, sub_q1_input_ids, sub_q1_attn_masks, \
            sub_q2_input_ids, sub_q2_attn_masks, sub_q1_edge_list, sub_q2_edge_list, q_edge_list, sub_q1_features, \
            sub_q2_features, q_features, sub_q1_mask, sub_q2_mask, q_mask, answer_starts, answer_ends, answer_texts, \
            answer_types, ques_types, qa_ids

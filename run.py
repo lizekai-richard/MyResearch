@@ -6,9 +6,12 @@ import time
 import shutil
 import random
 import torch
-from model import MyModel, BaseLineModel, NewModel
+import torch.nn.functional as F
+from model import BaseLineModel, NewModel
+from sp_model import SupportingFactBaseline
+from ques_type_classification.type_classification import TypeClassifier
 from data import *
-from transformers import RobertaTokenizer
+from transformers import RobertaTokenizer, BertTokenizer
 import torch.distributed as dist
 
 
@@ -25,14 +28,54 @@ def create_exp_dir(path, scripts_to_save=None):
             shutil.copyfile(script, dst_file)
 
 
-def train(config):
-    word2idx_dict, idx2word_dict, word_emb = read_features(config.word2idx_file, config.idx2word_file,
-                                                           config.word_emb_file)
+def select_top_k(logits, k=5):
+    # logits shape: [bsz, 2]
+    softmax_logits = F.softmax(logits, dim=-1)
+    scores = torch.max(softmax_logits, dim=-1)[0]
+    sorted, indices = torch.sort(scores, dim=-1, descending=True)
+    return indices[:k]
 
+
+def predict_sp(model, max_length, hotpot_data):
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    for example in tqdm(hotpot_data):
+        sp_data = prepare_sp_data(example)
+        pred_sp = []
+        ques_input_ids, ques_attn_mask, ctx_input_ids, ctx_attn_mask = prepare_input_data(
+            sp_data,
+            tokenizer,
+            max_length
+        )
+
+        logits = model(ques_input_ids, ques_attn_mask, ctx_input_ids,
+                       ctx_attn_mask)
+        topk_indices = select_top_k(logits).cpu().tolist()
+        for i in topk_indices:
+            pred_sp.append(sp_data[i]['context'])
+
+        example['sp_sentences'] = pred_sp
+
+    return hotpot_data
+
+
+def train(config, ngpus_per_node):
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
+
+    if config.gpu is not None:
+        print("Use GPU: {} for training".format(config.gpu))
+
+    if config.distributed:
+        if config.dist_url == "env://" and config.rank == -1:
+            config.rank = int(os.environ["RANK"])
+        if config.multiprocessing_distributed:
+            # For multiprocessing distributed training, rank needs to be the
+            # global rank among all the processes
+            config.rank = config.rank * ngpus_per_node + config.gpu
+        dist.init_process_group(backend=config.dist_backend, init_method=config.dist_url,
+                                world_size=config.world_size, rank=config.rank)
 
     config.save = '{}-{}'.format(config.save, time.strftime("%Y%m%d-%H%M%S"))
     create_exp_dir(config.save, scripts_to_save=['run.py', 'model.py', 'util.py'])
@@ -48,29 +91,76 @@ def train(config):
     for k, v in config.__dict__.items():
         logging('    - {} : {}'.format(k, v))
 
-    device = torch.device('cuda:0')
+
 
     print("loading tokenizer...")
     tokenizer = RobertaTokenizer.from_pretrained(config.roberta_config)
     print("Done!")
 
     print("Building DataLoader...")
-    train_ds = HotpotQADataset(config, is_train=False)
-    train_loader = generate_dataloader(train_ds, config.batch_size)
+    train_ds = HotpotQADataset(config, is_train=True)
+    if config.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+    else:
+        train_sampler = None
+    train_loader = generate_dataloader(train_ds, config.batch_size, data_sampler=train_sampler)
 
     dev_ds = HotpotQADataset(config, is_train=False)
-    dev_loader = generate_dataloader(dev_ds, config.batch_size, is_train=False)
+    if config.distributed:
+        dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_ds)
+    else:
+        dev_sampler = None
+    dev_loader = generate_dataloader(dev_ds, config.batch_size, is_train=False, data_sampler=dev_sampler)
     print("Done!")
 
     print("Building model...")
-    model = NewModel(config)
-    model = model.to(device)
-    logging('nparams {}'.format(sum([p.nelement() for p in model.parameters() if p.requires_grad])))
+    qa_model = NewModel(config)
+    logging('nparams {}'.format(sum([p.nelement() for p in qa_model.parameters() if p.requires_grad])))
+
+    q_type_model = TypeClassifier(config)
+    sp_model = SupportingFactBaseline(config)
+
+    if not torch.cuda.is_available():
+        print('using CPU, this will be slow')
+    elif config.distributed:
+        # For multiprocessing distributed, DistributedDataParallel constructor
+        # should always set the single device scope, otherwise,
+        # DistributedDataParallel will use all available devices.
+        if config.gpu is not None:
+            torch.cuda.set_device(config.gpu)
+            qa_model.cuda(config.gpu)
+            # When using a single GPU per process and per
+            # DistributedDataParallel, we need to divide the batch size
+            # ourselves based on the total number of GPUs we have
+            config.batch_size = int(config.batch_size / ngpus_per_node)
+            config.workers = int((config.workers + ngpus_per_node - 1) / ngpus_per_node)
+            qa_model = nn.parallel.DistributedDataParallel(qa_model, device_ids=[config.gpu],
+                                                           find_unused_parameters=True)
+        else:
+            qa_model.cuda()
+            # DistributedDataParallel will divide and allocate batch_size to all
+            # available GPUs if device_ids are not set
+            qa_model = nn.parallel.DistributedDataParallel(qa_model, find_unused_parameters=True)
+    elif config.gpu is not None:
+        torch.cuda.set_device(config.gpu)
+        qa_model = qa_model.cuda(config.gpu)
+        sp_model = sp_model.cuda(config.gpu)
+        q_type_model = q_type_model.cuda(config.gpu)
+    else:
+        # DataParallel will divide and allocate batch_size to all available GPUs
+        model = nn.DataParallel(qa_model).cuda()
+
+    for param in sp_model.parameters():
+        param.requires_grad_(False)
+
+    for param in q_type_model.parameters():
+        param.requires_grad_(False)
     print("Done!")
 
     lr = config.init_lr
-    criterion = nn.CrossEntropyLoss(reduction='mean', ignore_index=IGNORE_INDEX)
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config.init_lr)
+    criterion = nn.CrossEntropyLoss(reduction='mean', ignore_index=IGNORE_INDEX).cuda()
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, qa_model.parameters()), lr=config.init_lr,
+                            weight_decay=config.weight_decay)
     cur_patience = 0
     total_loss = 0
     global_step = 0
@@ -78,7 +168,7 @@ def train(config):
     stop_train = False
     start_time = time.time()
     eval_start_time = time.time()
-    model.train()
+    qa_model.train()
 
     for epoch in range(config.num_epochs):
         for batch in train_loader:
@@ -88,19 +178,20 @@ def train(config):
             answer_types, ques_types, qa_ids = batch
 
             ctx_input_ids, ctx_attn_mask = ctx_input_ids.cuda(), ctx_attn_masks.cuda()
-            ques_input_ids, ques_attn_mask = ques_input_ids.cuda(), ques_attn_mask.cuda()
             sub_q1_input_ids, sub_q1_attn_masks = sub_q1_input_ids.cuda(), sub_q1_attn_masks.cuda()
             sub_q2_input_ids, sub_q2_attn_masks = sub_q2_input_ids.cuda(), sub_q2_attn_masks.cuda()
             answer_starts, answer_ends, answer_types, ques_types = answer_starts.cuda(), answer_ends.cuda(), \
                                                                    answer_types.cuda(), ques_types.cuda()
 
-            logit_start, logit_end, logit_answer_type, logit_ques_types = model(ctx_input_ids, ctx_attn_mask,
-                                                                                ques_input_ids, ques_attn_mask,
-                                                                                sub_q1_input_ids, sub_q1_attn_masks,
-                                                                                sub_q2_input_ids, sub_q2_attn_masks)
+            type_logits = q_type_model(ques_input_ids, ques_attn_mask, q_edge_list, q_features, q_mask)
+            type_pred = type_logits.argmax(dim=-1).cpu().tolist()
+
+            logit_start, logit_end, logit_answer_type = qa_model(ctx_input_ids, ctx_attn_mask, sub_q1_input_ids,
+                                                                 sub_q1_attn_masks, sub_q2_input_ids, sub_q2_attn_masks,
+                                                                 type_pred)
 
             loss = criterion(logit_start, answer_starts) + criterion(logit_end, answer_ends) + criterion(
-                logit_answer_type, answer_types) + criterion(logit_ques_types, ques_types)
+                logit_answer_type, answer_types)
 
             optimizer.zero_grad()
             loss.backward()
@@ -122,7 +213,7 @@ def train(config):
 
             if global_step % config.checkpoint == 0:
                 model.eval()
-                metrics = evaluate_batch(dev_loader, model, criterion, 0, tokenizer)
+                metrics = evaluate_batch(dev_loader, model, criterion, tokenizer)
                 model.train()
 
                 logging('-' * 89)
@@ -154,49 +245,41 @@ def train(config):
     logging('best_dev_F1 {}'.format(best_dev_F1))
 
 
-def evaluate_batch(data_iter, model, criterion, max_batches, tokenizer):
+def evaluate_batch(data_iter, model, criterion, tokenizer):
     answer_list = []
     pred_list = []
     total_loss, step_cnt = 0, 0
-    for step, batch in enumerate(data_iter):
+    with torch.no_grad():
+        for step, batch in enumerate(data_iter):
+            ctx_input_ids, ctx_attn_masks, ques_input_ids, ques_attn_mask, sub_q1_input_ids, sub_q1_attn_masks, \
+            sub_q2_input_ids, sub_q2_attn_masks, sub_q1_edge_list, sub_q2_edge_list, q_edge_list, sub_q1_features, \
+            sub_q2_features, q_features, sub_q1_mask, sub_q2_mask, q_mask, answer_starts, answer_ends, answer_texts, \
+            answer_types, ques_types, qa_ids = batch
 
-        if step >= max_batches > 0:
-            break
+            ctx_input_ids, ctx_attn_mask = ctx_input_ids.cuda(), ctx_attn_masks.cuda()
+            sub_q1_input_ids, sub_q1_attn_masks = sub_q1_input_ids.cuda(), sub_q1_attn_masks.cuda()
+            sub_q2_input_ids, sub_q2_attn_masks = sub_q2_input_ids.cuda(), sub_q2_attn_masks.cuda()
+            answer_starts, answer_ends, answer_typess = answer_starts.cuda(), answer_ends.cuda(), answer_types.cuda()
 
-        ctx_input_ids, ctx_attn_masks, ques_input_ids, ques_attn_mask, sub_q1_input_ids, sub_q1_attn_masks, \
-        sub_q2_input_ids, sub_q2_attn_masks, sub_q1_edge_list, sub_q2_edge_list, q_edge_list, sub_q1_features, \
-        sub_q2_features, q_features, sub_q1_mask, sub_q2_mask, q_mask, answer_starts, answer_ends, answer_texts, \
-        answer_types, ques_types, qa_ids = batch
+            logit_start, logit_end, logit_answer_type = model(ctx_input_ids, ctx_attn_mask, sub_q1_input_ids,
+                                                              sub_q1_attn_masks, sub_q2_input_ids, sub_q2_attn_masks)
 
-        ctx_input_ids, ctx_attn_mask = ctx_input_ids.cuda(), ctx_attn_masks.cuda()
-        ques_input_ids, ques_attn_mask = ques_input_ids.cuda(), ques_attn_mask.cuda()
-        sub_q1_input_ids, sub_q1_attn_masks = sub_q1_input_ids.cuda(), sub_q1_attn_masks.cuda()
-        sub_q2_input_ids, sub_q2_attn_masks = sub_q2_input_ids.cuda(), sub_q2_attn_masks.cuda()
-        answer_starts, answer_ends, answer_types, ques_types = answer_starts.cuda(), answer_ends.cuda(), \
-                                                               answer_types.cuda(), ques_types.cuda()
+            loss = criterion(logit_start, answer_starts) + criterion(logit_end, answer_ends) + criterion(
+                logit_answer_type, answer_types)
 
-        logit_start, logit_end, logit_answer_type, logit_ques_types = model(ctx_input_ids, ctx_attn_mask,
-                                                                            ques_input_ids, ques_attn_mask,
-                                                                            sub_q1_input_ids, sub_q1_attn_masks,
-                                                                            sub_q2_input_ids, sub_q2_attn_masks)
+            start_pred = torch.argmax(logit_start, dim=-1)
+            end_pred = torch.argmax(logit_end, dim=-1)
+            answer_type_pred = torch.argmax(logit_answer_type, dim=-1)
 
-        loss = criterion(logit_start, answer_starts) + criterion(logit_end, answer_ends) + criterion(
-            logit_answer_type, answer_types) + criterion(logit_ques_types, ques_types)
+            predicted_answers = [
+                convert_ids_to_tokens(ctx_input_ids[i], tokenizer, start_pred[i], end_pred[i], answer_type_pred[i])
+                for i in range(len(qa_ids))]
 
-        start_pred = torch.argmax(logit_start, dim=-1)
-        end_pred = torch.argmax(logit_end, dim=-1)
-        answer_type_pred = torch.argmax(logit_answer_type, dim=-1)
-        ques_type_pred = torch.argmax(logit_ques_types, dim=-1)
+            answer_list.extend(answer_texts)
+            pred_list.extend(predicted_answers)
 
-        predicted_answers = [
-            convert_ids_to_tokens(ctx_input_ids[i], tokenizer, start_pred[i], end_pred[i], answer_type_pred[i])
-            for i in range(len(qa_ids))]
-
-        answer_list.extend(answer_texts)
-        pred_list.extend(predicted_answers)
-
-        total_loss += loss.item()
-        step_cnt += 1
+            total_loss += loss.item()
+            step_cnt += 1
     loss = total_loss / step_cnt
     metrics = evaluate(answer_list, pred_list)
     metrics['loss'] = loss

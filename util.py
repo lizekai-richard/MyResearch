@@ -153,7 +153,7 @@ def evaluate(ground_truth, predicted_answer):
 def normalize_answer(s):
     def remove_redundant_whitespace(text):
         return text.strip()
-    
+
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
 
@@ -226,7 +226,10 @@ def split_graph_features(total_graph_emb, mask_list, device='cuda'):
     graph_mask_list = [graph_padding(features, max_num_nodes, device)[1] for features in graph_emb_list]
     graph_emb = torch.stack(graph_emb_list)
     graph_mask = torch.stack(graph_mask_list)
-    return graph_emb, graph_mask
+    if device == 'cuda':
+        return graph_emb.cuda(), graph_mask.cuda()
+    else:
+        return graph_emb, graph_mask
 
 
 def construct_roberta_features(tokenizer, texts, max_length):
@@ -305,4 +308,51 @@ def save_eval_data(answers, predictions, idx):
     with open('./eval_files/eval_data_{}.txt'.format(idx), 'w', encoding='utf-8') as f:
         f.write("----".join(answers) + "\n")
         f.write("----".join(predictions) + "\n")
+
+
+def prepare_sp_data(example):
+    sp_data = []
+    question = example['question']
+    contexts = example['context']
+    id = example['_id']
+
+    for i, context in enumerate(contexts):
+        sentences = context[1]
+        for j, sentence in enumerate(sentences):
+            sp_data.append({
+                'id': id + str(i) + str(j),
+                'question': question,
+                'context': sentence,
+                'gold_label': 'irrelevant'
+            })
+
+    return sp_data
+
+
+def prepare_input_data(sp_data, tokenizer, max_length):
+    ques_input_ids = []
+    ques_attn_mask = []
+    ctx_input_ids = []
+    ctx_attn_mask = []
+
+    for sp_pair in sp_data:
+        question = sp_pair['question']
+        context = sp_pair['context']
+        ques_features = tokenizer(question, max_length=max_length, padding='max_length',
+                                  truncation=True, return_tensor='pt')
+        ctx_features = tokenizer(context, max_length=max_length, padding='max_length',
+                                 truncation=True, return_tensor='pt')
+        ques_input_ids.append(ques_features['input_ids'])
+        ques_attn_mask.append(ques_features['attention_mask'])
+        ctx_input_ids.append(ctx_features['input_ids'])
+        ctx_attn_mask.append(ctx_features['attention_mask'])
+
+    ques_input_ids = torch.stack(ques_input_ids, dim=-1)
+    ques_attn_mask = torch.stack(ques_attn_mask, dim=-1)
+    ctx_input_ids = torch.stack(ctx_input_ids, dim=-1)
+    ctx_attn_mask = torch.stack(ctx_attn_mask, dim=-1)
+
+    return ques_input_ids.cuda(), ques_attn_mask.cuda(), ctx_input_ids.cuda(), ctx_attn_mask.cuda()
+
+
 

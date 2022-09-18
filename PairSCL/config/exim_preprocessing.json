@@ -1,0 +1,13 @@
+{
+    "data_dir": "../datasets/exim",
+    "target_dir": "../datasets/preprocessed/EXIM",
+
+    "lowercase": false,
+    "ignore_punctuation": false,
+    "num_words": null,
+    "stopwords": [],
+    "labeldict": {"explicit": 0,
+                  "implicit": 1},
+    "bos": "_BOS_",
+    "eos": "_EOS_"
+}

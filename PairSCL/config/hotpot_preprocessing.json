@@ -1,0 +1,13 @@
+{
+    "data_dir": "../Hotpot",
+    "target_dir": "../datasets/preprocessed/Hotpot",
+
+    "lowercase": false,
+    "ignore_punctuation": false,
+    "num_words": null,
+    "stopwords": [],
+    "labeldict": {"irrelavant": 0,
+                  "relevant": 1},
+    "bos": "_BOS_",
+    "eos": "_EOS_"
+}
